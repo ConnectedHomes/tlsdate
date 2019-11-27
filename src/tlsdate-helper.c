@@ -487,37 +487,29 @@ read_http_date_from_bio(BIO *bio, uint32_t *result)
   return -2;
 }
 
-void
-openssl_time_callback (const SSL* ssl, int where, int ret)
+int
+openssl_verify_callback(int preverify, X509_STORE_CTX* x509_ctx)
 {
-  if (where == SSL_CB_CONNECT_LOOP && SSL_get_state(ssl) == TLS_ST_CR_SRVR_HELLO)
-  {
     // XXX TODO: If we want to trust the remote system for time,
-    // can we just read that time out of the remote system and if the
-    // cert verifies, decide that the time is reasonable?
+    // we can't use our broken concept of time to verify it's cert.
     // Such a process seems to indicate that a once valid cert would be
-    // forever valid - we stopgap that by ensuring it isn't less than
-    // the latest compiled_time and isn't above max_reasonable_time...
+    // forever valid - oh well...
     // XXX TODO: Solve eternal question about the Chicken and the Egg...
-    uint32_t compiled_time = RECENT_COMPILE_DATE;
-    uint32_t max_reasonable_time = MAX_REASONABLE_TIME;
-    uint32_t server_time;
-    verb("V: freezing time for x509 verification");
-    SSL_get_server_random(ssl, (unsigned char *)&server_time, sizeof server_time);
-    if (compiled_time < ntohl(server_time)
-        &&
-        ntohl(server_time) < max_reasonable_time)
-    {
-      verb("V: remote peer provided: %d, preferred over compile time: %d",
-            ntohl(server_time), compiled_time);
-      verb("V: freezing time with X509_VERIFY_PARAM_set_time");
-      X509_VERIFY_PARAM_set_time(X509_STORE_get0_param(SSL_CTX_get_cert_store(SSL_get_SSL_CTX(ssl))),
-                                 (time_t) ntohl(server_time) + 86400);
-    } else {
-      die("V: the remote server is a false ticker! server: %d compile: %d",
-           ntohl(server_time), compiled_time);
+    /* For error codes, see http://www.openssl.org/docs/apps/verify.html  */
+    int err = X509_STORE_CTX_get_error(x509_ctx);
+
+    if (err == X509_V_ERR_CERT_NOT_YET_VALID)
+      verb("V: accepting certificate from the future");
+
+    if (err == X509_V_ERR_CERT_HAS_EXPIRED)
+      verb("V: accepting expired certificate");
+
+    if (err == X509_V_ERR_CERT_NOT_YET_VALID || err == X509_V_ERR_CERT_HAS_EXPIRED) {
+        X509_STORE_CTX_set_error(x509_ctx, X509_V_OK);
+        return 1;
     }
-  }
+
+    return preverify;
 }
 
 uint32_t
@@ -979,6 +971,11 @@ run_ssl (uint32_t *time_map, int time_is_an_illusion, int http)
         }
       }
     }
+
+    if (time_is_an_illusion)
+    {
+      SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, openssl_verify_callback);
+    }
   }
 
   verb("V: opening socket to %s:%s", host, port);
@@ -987,11 +984,6 @@ run_ssl (uint32_t *time_map, int time_is_an_illusion, int http)
   BIO_get_ssl(s_bio, &ssl);
   if (NULL == ssl)
     die ("SSL setup failed");
-
-  if (time_is_an_illusion)
-  {
-    SSL_set_info_callback(ssl, openssl_time_callback);
-  }
 
   SSL_set_mode(ssl, SSL_MODE_AUTO_RETRY);
   SSL_set_tlsext_host_name (ssl, host);
